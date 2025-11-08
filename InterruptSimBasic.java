@@ -1,226 +1,179 @@
 import java.util.*;
-import java.util.concurrent.*;
-import java.util.concurrent.locks.*;
 
-/**
- * Interrupt controller implemented with a priority queue and explicit mask handling.
- * This version focuses on readability, safe concurrency, and separation of concerns.
- */
-public class InterruptControllerV2 {
+public class InterruptSim {
 
-    public enum Device {
-        PRINTER(10),    // lower number => lower priority
-        DISK(20),
-        NETWORK(30);
+    // Priority: bigger number = higher priority
+    enum Peripheral {
+        KEYBOARD("Keyboard", 3),
+        MOUSE("Mouse", 2),
+        PRINTER("Printer", 1);
 
-        private final int priority;
-        Device(int priority) { this.priority = priority; }
-        public int priority() { return priority; }
-    }
-
-    /**
-     * An interrupt event. Comparable so the PriorityBlockingQueue orders by descending priority.
-     */
-    public static final class InterruptEvent implements Comparable<InterruptEvent> {
-        public final Device device;
-        public final String payload;
-        public final long timestamp;
-
-        public InterruptEvent(Device device, String payload) {
-            this.device = Objects.requireNonNull(device);
-            this.payload = payload;
-            this.timestamp = System.currentTimeMillis();
-        }
-
-        // Higher priority value should come first -> reverse order
-        @Override
-        public int compareTo(InterruptEvent other) {
-            int cmp = Integer.compare(other.device.priority(), this.device.priority());
-            if (cmp != 0) return cmp;
-            // tie-breaker: older events first
-            return Long.compare(this.timestamp, other.timestamp);
-        }
-
-        @Override public String toString() {
-            return String.format("[%s:%s@%d]", device, payload, timestamp);
+        final String label;
+        final int priority;
+        Peripheral(String label, int priority) {
+            this.label = label;
+            this.priority = priority;
         }
     }
 
-    // Core data structures
-    private final PriorityBlockingQueue<InterruptEvent> queue = new PriorityBlockingQueue<>();
-    private final Map<Device, Boolean> maskMap = new EnumMap<>(Device.class);
-
-    // Lock & condition for mask changes and graceful shutdown signalling.
-    private final ReentrantLock lock = new ReentrantLock();
-    private final Condition maskOrStopChanged = lock.newCondition();
-
-    private volatile boolean running = true;
-
-    public InterruptControllerV2() {
-        for (Device d : Device.values()) maskMap.put(d, false); // all unmasked initially
-    }
-
-    /** Submit a new interrupt event (thread-safe). */
-    public void submit(InterruptEvent ev) {
-        queue.offer(ev);
-        // Wake up any waiting controller thread if it's waiting due to all top events being masked.
-        signalController();
-    }
-
-    /** Mask or unmask a device. */
-    public void setMask(Device device, boolean masked) {
-        lock.lock();
-        try {
-            maskMap.put(device, masked);
-            System.out.printf("Mask changed: %s -> %b%n", device, masked);
-            maskOrStopChanged.signalAll();
-        } finally {
-            lock.unlock();
+    // Small record of which peripheral raised an interrupt this cycle
+    static class InterruptEvent {
+        Peripheral peripheral;
+        long sequence;
+        InterruptEvent(Peripheral p, long seq) {
+            this.peripheral = p;
+            this.sequence = seq;
         }
     }
 
-    /** Stop the controller gracefully: existing queued events may still be processed if possible. */
-    public void stop() {
-        lock.lock();
-        try {
-            running = false;
-            maskOrStopChanged.signalAll();
-        } finally {
-            lock.unlock();
+    // Mask flags (true = masked / disabled)
+    static boolean keyboardMasked = false;
+    static boolean mouseMasked = false;
+    static boolean printerMasked = false;
+
+    // RNG for generating interrupts
+    static Random random = new Random();
+
+    // Helper to check mask by peripheral
+    static boolean isPeripheralMasked(Peripheral p) {
+        switch (p) {
+            case KEYBOARD: return keyboardMasked;
+            case MOUSE:    return mouseMasked;
+            case PRINTER:  return printerMasked;
+            default:       return false;
         }
     }
 
-    /** Ask whether a device is currently masked (snapshot view). */
-    private boolean isMasked(Device d) {
-        // small optimization: no lock for read because maskMap values are only changed under lock,
-        // but to be strictly consistent we read under lock.
-        lock.lock();
-        try {
-            return maskMap.getOrDefault(d, true);
-        } finally {
-            lock.unlock();
+    // Simulated ISR: process the interrupt
+    static void processInterrupt(Peripheral p) {
+        System.out.println(p.label + " Interrupt received → processing handler...");
+        try { Thread.sleep(150); } catch (InterruptedException ignored) {}
+        System.out.println(p.label + " handler finished.");
+    }
+
+    // Run one simulation cycle (tick)
+    static void runCycle(long cycleNumber) {
+        System.out.println("\n=== CYCLE " + cycleNumber + " ===");
+
+        // Randomly decide which peripherals triggered this cycle
+        boolean keyboardFired = random.nextDouble() < 0.50; // 50% chance
+        boolean mouseFired    = random.nextDouble() < 0.40; // 40% chance
+        boolean printerFired  = random.nextDouble() < 0.30; // 30% chance
+
+        List<InterruptEvent> events = new ArrayList<>();
+        long seq = 1;
+        if (keyboardFired) events.add(new InterruptEvent(Peripheral.KEYBOARD, seq++));
+        if (mouseFired)    events.add(new InterruptEvent(Peripheral.MOUSE,    seq++));
+        if (printerFired)  events.add(new InterruptEvent(Peripheral.PRINTER,  seq++));
+
+        if (events.isEmpty()) {
+            System.out.println("No interrupts this cycle.");
+            return;
+        }
+
+        // Report masked interrupts and find the highest-priority unmasked event
+        for (InterruptEvent ev : events) {
+            if (isPeripheralMasked(ev.peripheral)) {
+                System.out.println(ev.peripheral.label + " interrupt ignored (masked).");
+            }
+        }
+
+        InterruptEvent chosen = null;
+        for (InterruptEvent ev : events) {
+            if (isPeripheralMasked(ev.peripheral)) continue;
+            if (chosen == null || ev.peripheral.priority > chosen.peripheral.priority) {
+                chosen = ev;
+            }
+        }
+
+        if (chosen == null) {
+            System.out.println("All interrupts were masked; nothing processed this cycle.");
+        } else {
+            processInterrupt(chosen.peripheral);
         }
     }
 
-    private void signalController() {
-        lock.lock();
-        try {
-            maskOrStopChanged.signalAll();
-        } finally {
-            lock.unlock();
+    // Display current mask configuration
+    static void displayMaskStatus() {
+        System.out.println("\nMask Configuration:");
+        System.out.println("  Keyboard masked: " + keyboardMasked);
+        System.out.println("  Mouse masked:    " + mouseMasked);
+        System.out.println("  Printer masked:  " + printerMasked);
+    }
+
+    // Update a peripheral's mask by name
+    static void updateMask(String name, boolean state) {
+        String lower = name.toLowerCase();
+        if (lower.startsWith("key")) {
+            keyboardMasked = state;
+            System.out.println("Keyboard masked -> " + state);
+        } else if (lower.startsWith("mou")) {
+            mouseMasked = state;
+            System.out.println("Mouse masked -> " + state);
+        } else if (lower.startsWith("pri")) {
+            printerMasked = state;
+            System.out.println("Printer masked -> " + state);
+        } else {
+            System.out.println("Unknown peripheral. Use: keyboard, mouse, printer");
         }
     }
 
-    /**
-     * Controller worker class that drains queue and executes ISR-like handlers.
-     * It performs lazy skipping of masked events: when the top event is masked it temporarily
-     * moves it aside and waits for either unmask or new arrivals.
-     */
-    public void runControllerLoop() {
-        List<InterruptEvent> deferred = new ArrayList<>();
+    public static void main(String[] args) {
+        Scanner sc = new Scanner(System.in);
+        long cycle = 1;
+
+        System.out.println("=== Interrupt Simulator (Refactor) ===");
+        System.out.println("Priority: Keyboard > Mouse > Printer");
+        System.out.println("Commands:");
+        System.out.println("  step           → run one cycle");
+        System.out.println("  step n         → run n cycles");
+        System.out.println("  mask <name>    → mask keyboard|mouse|printer");
+        System.out.println("  unmask <name>  → unmask peripheral");
+        System.out.println("  status         → show mask configuration");
+        System.out.println("  reset          → unmask all peripherals");
+        System.out.println("  quit           → exit");
+        displayMaskStatus();
 
         while (true) {
-            if (!running && queue.isEmpty()) {
-                // No more events and we should stop
-                log("Controller exiting: stopped and queue empty.");
-                break;
-            }
+            System.out.print("\n> ");
+            String line = sc.nextLine().trim();
+            if (line.isEmpty()) continue;
+            String[] parts = line.split("\\s+");
+            String cmd = parts[0].toLowerCase();
 
-            try {
-                // Try to take the highest-priority event (blocks if queue empty)
-                InterruptEvent top = queue.take(); // blocks until an element is available
-
-                // If the event's device is masked, move it to deferred list and wait for change.
-                if (isMasked(top.device)) {
-                    deferred.add(top);
-                    log("Top event deferred because its device is masked: " + top);
-                    // Wait for either an unmask / stop signal or new items inserted. Use condition to await.
-                    lock.lock();
-                    try {
-                        // Use a timed wait to periodically re-check deferred vs queue to avoid deadlocks.
-                        // The timeout is modest: 200 ms.
-                        if (running && allDeferredMasked(deferred)) {
-                            maskOrStopChanged.await(200, TimeUnit.MILLISECONDS);
-                        }
-                    } finally {
-                        lock.unlock();
+            switch (cmd) {
+                case "quit":
+                    System.out.println("Exiting simulator. Bye!");
+                    sc.close();
+                    return;
+                case "status":
+                    displayMaskStatus();
+                    break;
+                case "reset":
+                    keyboardMasked = mouseMasked = printerMasked = false;
+                    System.out.println("All peripherals unmasked.");
+                    displayMaskStatus();
+                    break;
+                case "mask":
+                    if (parts.length >= 2) updateMask(parts[1], true);
+                    else System.out.println("Usage: mask <keyboard|mouse|printer>");
+                    break;
+                case "unmask":
+                    if (parts.length >= 2) updateMask(parts[1], false);
+                    else System.out.println("Usage: unmask <keyboard|mouse|printer>");
+                    break;
+                case "step":
+                    int times = 1;
+                    if (parts.length >= 2) {
+                        try { times = Math.max(1, Integer.parseInt(parts[1])); }
+                        catch (NumberFormatException e) { System.out.println("Invalid number; running 1 cycle."); }
                     }
-
-                    // Before continuing, re-insert any events from deferred back into the queue
-                    if (!deferred.isEmpty()) {
-                        for (InterruptEvent e : deferred) queue.offer(e);
-                        deferred.clear();
-                    }
-                    continue;
-                }
-
-                // If we get here, 'top' is unmasked and can be handled
-                log("Dispatching ISR for: " + top);
-                // Execute ISR outside of any controller lock; handleIsr may be blocking/slow.
-                handleIsr(top);
-
-            } catch (InterruptedException ie) {
-                Thread.currentThread().interrupt();
-                log("Controller thread interrupted; re-checking running flag.");
+                    for (int i = 0; i < times; i++) runCycle(cycle++);
+                    break;
+                default:
+                    System.out.println("Unknown command. Try: step | step 5 | mask keyboard | unmask mouse | status | reset | quit");
             }
         }
-    }
-
-    /** Helper: are all events in deferred currently masked? (checked under lock) */
-    private boolean allDeferredMasked(List<InterruptEvent> deferred) {
-        lock.lock();
-        try {
-            for (InterruptEvent e : deferred) {
-                if (!maskMap.getOrDefault(e.device, true)) return false;
-            }
-            return true;
-        } finally {
-            lock.unlock();
-        }
-    }
-
-    /** Simulated ISR work — runs without taking any controller locks. */
-    private void handleIsr(InterruptEvent event) {
-        // Example: pretend to do some work; in real systems this would signal device drivers, etc.
-        log("Handling ISR start: " + event);
-        try {
-            // Simulate work
-            Thread.sleep(120);
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-        }
-        log("Handling ISR done : " + event);
-    }
-
-    private static void log(String msg) {
-        System.out.printf("[%s] %s%n", Thread.currentThread().getName(), msg);
-    }
-
-    // ------------------- Simple demo -------------------
-    public static void main(String[] args) throws InterruptedException {
-        InterruptControllerV2 controller = new InterruptControllerV2();
-        Thread worker = new Thread(controller::runControllerLoop, "ControllerWorker");
-        worker.start();
-
-        // producers
-        controller.submit(new InterruptEvent(Device.PRINTER, "print job 1"));
-        controller.submit(new InterruptEvent(Device.NETWORK, "rx packet A"));
-        controller.submit(new InterruptEvent(Device.DISK, "write complete"));
-
-        // mask network for a while
-        controller.setMask(Device.NETWORK, true);
-        controller.submit(new InterruptEvent(Device.NETWORK, "rx packet B (masked)"));
-
-        Thread.sleep(500);
-
-        // unmask network so deferred network events can be handled
-        controller.setMask(Device.NETWORK, false);
-
-        Thread.sleep(700);
-
-        // shutdown
-        controller.stop();
-        worker.join();
-        System.out.println("Demo completed.");
     }
 }
+
